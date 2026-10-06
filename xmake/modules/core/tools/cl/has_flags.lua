@@ -24,37 +24,24 @@ import("core.cache.global_detectcache")
 import("core.tools.cl.check_knownargs")
 import("private.tools.vstool")
 
--- get the argument list of this driver, and whether it knows /options:strict
---
--- the option list is fetched once per program+version and cached. @see
--- https://github.com/xmake-io/xmake/issues/7610
-function _get_arglist(opt)
+-- attempt to check it from the argument list
+function _check_from_arglist(flags, opt)
     local key = "core.tools.cl.has_flags"
     local flagskey = opt.program .. "_" .. (opt.programver or "")
     local allflags = global_detectcache:get2(key, flagskey)
     if not allflags then
         allflags = {}
+        -- @see https://github.com/xmake-io/xmake/issues/7610
         local arglist = vstool.iorunv(opt.program, {"-?"}, {envs = opt.envs})
         if arglist then
             for arg in arglist:gmatch("(/[%-%a%d]+)%s+") do
                 allflags[arg:gsub("/", "-")] = true
             end
-            -- the class above stops at ':', so /options:strict can only ever be
-            -- keyed as "-options" here. the question of whether the driver has it
-            -- at all is asked of the text instead, and remembered beside the list.
-            -- unlike a flag name, this key cannot collide with one: every flag key
-            -- above begins with '-' after the gsub.
-            allflags._options_strict = arglist:find("options:strict", 1, true) ~= nil
         end
         global_detectcache:set2(key, flagskey, allflags)
         global_detectcache:save()
     end
-    return allflags
-end
-
--- attempt to check it from the argument list
-function _check_from_arglist(flags, opt)
-    return _get_arglist(opt)[flags[1]:gsub("/", "-")]
+    return allflags[flags[1]:gsub("/", "-")]
 end
 
 -- get extension
@@ -67,13 +54,14 @@ end
 -- two codes say it, and they are the only two ways cl can:
 --
 --   cl : Command line warning D9002 : ignoring unknown option '-xx'
---       the driver has no such option and no /options:strict to make it an error,
---       so cl drops it, compiles the stub and exits 0. the text is the only signal
---       that answer exists on.
+--       the driver has no such option, so cl drops it, compiles the stub and exits
+--       0. the exit code says success, so the text is the only place this answer
+--       exists.
 --   cl : Command line error D8043 : unknown option '-xx'
---       the same answer once /options:strict is in effect, and it arrives with a
---       non-zero exit, so vstool.iorunv raises before we are reached. matched so
---       that one rule covers both regimes.
+--       the same answer while /options:strict is in effect (VS 2022 17.0+, and only
+--       where the project asks for it), which comes with a non-zero exit -- so
+--       vstool.iorunv raises before we are reached. matched anyway, so that one
+--       rule covers both spellings.
 --
 -- every other code at exit 0 is not an answer about support:
 --
@@ -81,9 +69,11 @@ end
 --       the frontend's own warning, and what this filter exists for. cl prints it
 --       whenever -fsanitize=address arrives on a line with no debug-info flag
 --       (-Zi/-ZI/-Z7), which is how the probe line always looks once the asan flag
---       leaks into sysflags -- so every probe of every other flag answers with it.
+--       leaks into sysflags -- so every probe of every other flag answered with it.
 --   D9014 / D9025 / D9041 / D8021 : bad VALUES of options the driver does have,
---       where cl assumes a default and compiles anyway. that is support.
+--   D9035 : an option it has but no longer recommends. cl assumes a default,
+--       compiles the stub and exits 0. that is support, measured on both codes with
+--       and without /options:strict.
 --
 -- cl also echoes the source filename on every compile (-nologo only drops the
 -- banner), so that line is filtered out too.
@@ -126,23 +116,7 @@ function _check_try_running(flags, opt)
                             tmpfile = os.tmpfile()
                             nuldev = tmpfile
                         end
-                        local argv = table.join("-c", "-nologo")
-
-                        -- put /options:strict on the probe line where the driver has it,
-                        -- so an unsupported flag answers with a non-zero exit instead of
-                        -- text we have to interpret. it is VS 2022 17.0+ only, and this
-                        -- module is inherited by icl and ifort, so it is asked of the
-                        -- driver's own option list rather than assumed: on a driver
-                        -- without it the option is itself an unknown flag, and the D9002
-                        -- that earns would answer "unsupported" for every probe there is.
-                        --
-                        -- an unanswered question (a -? that fails) means no strict, which
-                        -- leaves the D9002 text scan above doing the work on its own.
-                        if try { function () return _get_arglist(opt)._options_strict end } then
-                            table.insert(argv, "-options:strict")
-                        end
-
-                        local outdata = vstool.iorunv(opt.program, table.join(argv, flags, "-Fo" .. nuldev, sourcefile),
+                        local outdata = vstool.iorunv(opt.program, table.join("-c", "-nologo", flags, "-Fo" .. nuldev, sourcefile),
                                             {envs = opt.envs, curdir = tmpdir}) -- we need to switch to tmpdir to avoid generating some tmp files, e.g. /Zi -> vc140.pdb
                         if tmpfile then
                             os.tryrm(tmpfile)
